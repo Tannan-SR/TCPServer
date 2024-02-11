@@ -15,7 +15,15 @@ queue <int> q;
 map <string, string> kv_datastore;
 pthread_t client_thread[N];
 
-
+int lock = 0;
+void acquire()
+{	
+	lock++;
+}
+void release()
+{
+	lock--;
+}
 
 void* handleClient(void* args);
 void* monitor(void*);
@@ -70,7 +78,11 @@ int main(int argc, char **argv)
         
         if(counter<N)
         {
-        pthread_create(&client_thread[counter++], NULL, &handleClient, (void*) &client_socket);
+         while(lock);
+         acquire();
+         counter++;
+         release();
+        pthread_create(&client_thread[counter], NULL, &handleClient, (void*) &client_socket);
 
 	cout<<"Counter "<<counter<<endl;
 	}
@@ -140,8 +152,11 @@ void* handleClient(void* args)
                 string value = line;
 
                 value.erase(0, 1);
-
+		
+		while(lock);
+		acquire();
                 kv_datastore[key] = value;
+                release();
                 send(client_socket, "FIN\n", 4, 0);
             }
             else if (!strcmp(line, "COUNT"))
@@ -157,7 +172,8 @@ void* handleClient(void* args)
             {
 
                 iss.getline(line, sizeof(line));
-
+		while(lock);
+		acquire();
                 if (kv_datastore.erase(line))
                 {
 
@@ -170,9 +186,14 @@ void* handleClient(void* args)
 
                     send(client_socket, "NULL\n", 5, 0);
                 }
+                release();
             }
             else if (!strcmp(line, "END"))
-            {
+            {	
+            	while(lock);
+            	acquire();
+            	counter--;
+            	release();
 
 		send(client_socket,"\n",1,0);
                 close(client_socket);
