@@ -8,7 +8,7 @@
 #include <netinet/in.h>
 #include <pthread.h>
 
-#define N 5
+#define N 100
 using namespace std;
 int counter = 0;
 queue <int> q;
