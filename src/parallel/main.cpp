@@ -1,229 +1,451 @@
-#include <iostream>
-#include <sstream>
-#include <cstring>
-#include <map>
-#include <queue>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
+#include <stdio.h>
+
+#include <stdlib.h>
+
 #include <pthread.h>
 
-#define N 105
+#include <string.h>
+
+#include <string>
+
+#include <netinet/in.h>
+
+#include <unistd.h>
+
+#include <sys/socket.h>
+
+#include <unordered_map>
+
+#include <sstream>
+
+#include <iostream>
+
+#include <vector>
+
+#include <sys/socket.h>
+
+#include <arpa/inet.h>
+
+#include <queue>
+
+#include <chrono>
+
+#include <thread>
+
 using namespace std;
-int counter = 0;
-queue <int> q;
-map <string, string> kv_datastore;
-pthread_t client_thread[N];
 
-int lock = 0;
-void acquire()
-{	
-	lock++;
-}
-void release()
+struct Thread
+
 {
-	lock--;
+
+  pthread_t thread_id;
+
+  int socketID;
+};
+
+struct ThreadArgs
+
+{
+
+  struct Thread *array;
+
+  size_t size;
+};
+
+queue<int> q;
+
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+
+pthread_mutex_t active = PTHREAD_MUTEX_INITIALIZER;
+
+pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+
+pthread_mutex_t pool_lock = PTHREAD_MUTEX_INITIALIZER;
+
+int active_threads = 0;
+
+unordered_map<string, string> kv_datastore;
+
+void write_into(int *pointer, string &key, string &value)
+
+{
+
+  value.erase(value.begin(), value.begin() + 1);
+
+  kv_datastore[key] = value;
+
+  *pointer++;
+
+  *pointer++;
 }
 
-void* handleClient(void* args);
-void* monitor(void*);
+void read_from(string &key, char *output)
+
+{
+
+  if (kv_datastore.find(key) == kv_datastore.end())
+
+  {
+
+    strcat(output, "NULL\n");
+  }
+
+  else
+
+  {
+
+    strcat(output, kv_datastore.find(key)->second.c_str());
+
+    strcat(output, "\n");
+  }
+}
+
+void gimme_count(char *output)
+
+{
+
+  int count = kv_datastore.size();
+
+  string str_count = to_string(count);
+
+  strcat(output, str_count.c_str());
+
+  strcat(output, "\n");
+}
+
+void remove(string &key, char *output)
+
+{
+
+  int ret = kv_datastore.erase(key);
+
+  if (ret == 0)
+
+  {
+
+    string res = "NULL\n";
+
+    strcat(output, res.c_str());
+  }
+
+  else
+
+  {
+
+    string res = "FIN\n";
+
+    strcat(output, res.c_str());
+  }
+}
+
+int handleClient(char *input, char *output)
+
+{
+
+  output[0] = '\0';
+
+  char delim = '\n';
+
+  istringstream ss(input);
+
+  string token;
+
+  vector<string> tokens;
+
+  while (getline(ss, token, delim))
+
+  {
+
+    tokens.push_back(token);
+  }
+
+  for (int i = 0; i < tokens.size(); i++)
+
+  {
+
+    auto &str = tokens[i];
+
+    if (str == "WRITE")
+
+    {
+
+      auto &key = tokens[i + 1];
+
+      auto &val = tokens[i + 2];
+
+      pthread_mutex_lock(&lock);
+
+      write_into(&i, key, val);
+
+      pthread_mutex_unlock(&lock);
+
+      strcat(output, "FIN\n");
+    }
+
+    else if (str == "READ")
+
+    {
+
+      auto &key = tokens[i + 1];
+
+      pthread_mutex_lock(&lock);
+
+      read_from(key, output);
+
+      pthread_mutex_unlock(&lock);
+
+      i++;
+    }
+
+    else if (str == "COUNT")
+
+    {
+
+      pthread_mutex_lock(&lock);
+
+      gimme_count(output);
+
+      pthread_mutex_unlock(&lock);
+    }
+
+    else if (str == "DELETE")
+
+    {
+
+      auto &key = tokens[i + 1];
+
+      pthread_mutex_lock(&lock);
+
+      remove(key, output);
+
+      pthread_mutex_unlock(&lock);
+
+      i++;
+    }
+
+    else if (str == "END")
+
+    {
+
+      strcat(output, "\n");
+
+      return -1;
+    }
+  }
+
+  return 0;
+}
+
+void *serve(void *randomm)
+
+{
+
+  int socketID = *((int *)randomm);
+
+  while (1)
+
+  {
+
+    char buffer[1024];
+
+    int val = read(socketID, buffer, 1024);
+
+    if (val > 0)
+
+    {
+
+      char response[1024];
+
+      int returnval = handleClient(buffer, response);
+
+      if (returnval == -1)
+
+      {
+
+        char buff[100] = {"recieved message\n"};
+
+        strcpy(buff, response);
+
+        write(socketID, buff, strlen(buff));
+
+        cout << "Terminating" << pthread_self() << endl;
+
+        close(socketID);
+
+        shutdown(socketID, SHUT_RDWR);
+
+        pthread_mutex_lock(&active);
+
+        active_threads--;
+
+        pthread_mutex_unlock(&active);
+
+        break;
+      }
+    }
+  }
+
+  pthread_exit(NULL);
+}
+
+void *handleClient(void *args)
+
+{
+
+  struct ThreadArgs *threadArgs = static_cast<ThreadArgs *>(args);
+
+  struct Thread *thread_pool = threadArgs->array;
+
+  while (1)
+
+  {
+
+    pthread_mutex_lock(&mutex);
+
+    int val = !q.empty();
+
+    pthread_mutex_unlock(&mutex);
+
+    if (val)
+
+    {
+
+      for (int i = 0; i < 8; i++)
+
+      {
+
+        pthread_mutex_lock(&pool_lock);
+
+        int threadTerminationStatus = pthread_tryjoin_np(thread_pool[i].thread_id, NULL);
+
+        pthread_mutex_unlock(&pool_lock);
+
+        if (threadTerminationStatus == 0)
+
+        {
+
+          pthread_join(thread_pool[i].thread_id, NULL);
+
+          pthread_mutex_lock(&mutex);
+
+          int fontele = q.front();
+
+          q.pop();
+
+          pthread_mutex_unlock(&mutex);
+
+          pthread_mutex_lock(&pool_lock);
+
+          thread_pool[i].socketID = fontele;
+
+          pthread_create(&thread_pool[i].thread_id, NULL, &serve, &thread_pool[i].socketID);
+
+          pthread_mutex_unlock(&pool_lock);
+        }
+      }
+    }
+
+    usleep(1000);
+  }
+}
 
 int main(int argc, char **argv)
-{    
 
-	if (argc != 2)
-    {
-
-        fprintf(stderr, "usage: %s <port>\n", argv[0]);
-
-        exit(1);
-    }
-
-    int portno = atoi(argv[1]);
-
-    int server_socket, client_socket;
-
-    sockaddr_in server_address, client_address;
-
-    socklen_t client_length;
-
-    server_socket = socket(AF_INET, SOCK_STREAM, 0);
-
-    server_address.sin_family = AF_INET;
-
-    server_address.sin_port = htons(portno);
-
-    server_address.sin_addr.s_addr = INADDR_ANY;
-
-    bind(server_socket, (struct sockaddr *)&server_address, sizeof(server_address));
-
-    listen(server_socket, 5);
-    
-    pthread_t leader;
-    pthread_create(&leader,NULL,&monitor,NULL);
-    
-
-    cout << "Listening on port " << portno << endl;
-    while (1)
-    {
-
-        client_length = sizeof(client_address);
-
-        client_socket = accept(server_socket, (struct sockaddr *)&client_address, &client_length);
-        if (client_socket == -1) {
-    perror("Error accepting connection");
-    	}
-        
-        cout<<"Client accepted\n";
-        
-        if(counter<N)
-        {
-         while(lock);
-         acquire();
-         counter++;
-         release();
-        pthread_create(&client_thread[counter], NULL, &handleClient, (void*) &client_socket);
-
-	cout<<"Counter "<<counter<<endl;
-	}
-	else
-	{
-		cout<<"Exceeded\n";
-		q.push(client_socket);
-		cout<<q.front()<<endl;
-	}
-
-        
-    }
-    close(client_socket);
-    close(server_socket);
-
-    return 0;
-}
-
-void* handleClient(void* args)
 {
 
-    char buffer[1024] = {0};
-    int client_socket = *((int*)(args)); 
+  int portno;
 
+  if (argc != 2)
 
-    while (read(client_socket, buffer, sizeof(buffer)) > 0)
+  {
+
+    fprintf(stderr, "usage: %s <port>\n", argv[0]);
+
+    exit(1);
+  }
+
+  portno = atoi(argv[1]);
+
+  struct sockaddr_in server, client;
+
+  int client_len, new_socket;
+
+  client_len = sizeof(server);
+
+  char buffer[1500];
+
+  int sock = socket(AF_INET, SOCK_STREAM, 0);
+
+  memset((char *)&server, 0, sizeof(server));
+
+  server.sin_family = AF_INET;
+
+  server.sin_addr.s_addr = htonl(INADDR_ANY);
+
+  server.sin_port = htons(portno);
+
+  bind(sock, (struct sockaddr *)&server, sizeof(server));
+
+  cout << "Listening at port no" << portno << endl;
+
+  listen(sock, 100);
+
+  pthread_t t;
+
+  int thread_number = 10;
+
+  struct Thread thread_pool[thread_number];
+
+  struct ThreadArgs threadArgs;
+
+  threadArgs.array = thread_pool;
+
+  threadArgs.size = thread_number;
+
+  pthread_create(&t, NULL, &handleClient, &threadArgs);
+
+  int returnvalue = 0;
+
+  while (1)
+
+  {
+
+    new_socket = accept(sock, (struct sockaddr *)&client, (socklen_t *)&client_len);
+
+    pthread_mutex_lock(&active);
+
+    int actno = active_threads++;
+
+    pthread_mutex_unlock(&active);
+
+    if (new_socket >= 0 && actno < thread_number)
+
     {
 
-        istringstream iss(buffer);
+      pthread_mutex_lock(&pool_lock);
 
-        char line[10] = {0};
+      thread_pool[actno].socketID = new_socket;
 
-        while (iss.getline(line, sizeof(line)))
-        {
+      pthread_create(&thread_pool[actno].thread_id, NULL, &serve, &thread_pool[actno].socketID);
 
-            if (!strcmp(line, "READ"))
-            {
-
-                string response;
-
-                iss.getline(line, sizeof(line));
-
-                auto it = kv_datastore.find(line);
-
-                if (it != kv_datastore.end())
-                {
-
-                    response =it->second + "\n";
-
-                    send(client_socket, response.c_str(), response.size(), 0);
-                }
-                else
-                {
-
-                    send(client_socket, "NULL\n", 5, 0);
-                }
-            }
-            else if (!strcmp(line, "WRITE"))
-            {
-
-                iss.getline(line, sizeof(line));
-
-                string key = line;
-
-                iss.getline(line, sizeof(line));
-
-                string value = line;
-
-                value.erase(0, 1);
-		
-		while(lock);
-		acquire();
-                kv_datastore[key] = value;
-                release();
-                send(client_socket, "FIN\n", 4, 0);
-            }
-            else if (!strcmp(line, "COUNT"))
-            {
-
-                string response;
-
-                response = kv_datastore.size() + "\n";
-
-                send(client_socket, response.c_str(), response.size(), 0);
-            }
-            else if (!strcmp(line, "DELETE"))
-            {
-
-                iss.getline(line, sizeof(line));
-		while(lock);
-		acquire();
-                if (kv_datastore.erase(line))
-                {
-
-                    //cout << "FIN" << endl;
-
-                    send(client_socket, "FIN\n", 4, 0);
-                }
-                else
-                {
-
-                    send(client_socket, "NULL\n", 5, 0);
-                }
-                release();
-            }
-            else if (!strcmp(line, "END"))
-            {	
-            	while(lock);
-            	acquire();
-            	counter--;
-            	release();
-
-		send(client_socket,"\n",1,0);
-                close(client_socket);
-
-                shutdown(client_socket, SHUT_RDWR);
-
-                break;
-            }
-        }
+      pthread_mutex_unlock(&pool_lock);
     }
+
+    else
+
+    {
+
+      pthread_mutex_lock(&mutex);
+
+      q.push(new_socket);
+
+      pthread_mutex_unlock(&mutex);
+    }
+  }
+
+  close(sock);
+
+  shutdown(sock, SHUT_RDWR);
+
+  return 0;
 }
-
-
-void* monitor(void*)
-{
-
-	while(1)
-	{
-		if(!q.empty())
-		{
-		for (int i = 0; i < N; i++){
-				int threadTerminationStatus = pthread_tryjoin_np(client_thread[i], NULL);
-				if (threadTerminationStatus == 0){
-					pthread_join(client_thread[i], NULL);
-					int x = q.front();
-					q.pop();
-					pthread_create(&client_thread[i], NULL, &handleClient, &x);
-					}
-				}
-		}
-	}
-}
-
